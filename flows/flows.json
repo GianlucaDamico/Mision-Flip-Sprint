@@ -1,0 +1,273 @@
+[
+  {
+    "id": "mqtt_in",
+    "type": "mqtt in",
+    "z": "main",
+    "name": "Telemetry IN",
+    "topic": "${MQTT_TOPIC_PREFIX}/+/events",
+    "qos": "1",
+    "datatype": "auto",
+    "broker": "broker_cfg",
+    "x": 140,
+    "y": 80,
+    "wires": [
+      [
+        "json_parse"
+      ]
+    ]
+  },
+  {
+    "id": "broker_cfg",
+    "type": "mqtt-broker",
+    "name": "Mosquitto",
+    "broker": "${MQTT_BROKER_HOST}",
+    "port": "${MQTT_BROKER_PORT}",
+    "clientid": "",
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": false,
+    "birthTopic": "",
+    "birthQos": "0",
+    "birthPayload": "",
+    "closeTopic": "",
+    "closeQos": "0",
+    "closePayload": "",
+    "willTopic": "",
+    "willQos": "0",
+    "willPayload": "",
+    "credentials": {
+      "user": "${MQTT_USERNAME}",
+      "password": "${MQTT_PASSWORD}"
+    }
+  },
+  {
+    "id": "json_parse",
+    "type": "json",
+    "z": "main",
+    "name": "Parse JSON",
+    "property": "payload",
+    "action": "",
+    "pretty": false,
+    "x": 360,
+    "y": 80,
+    "wires": [
+      [
+        "fn_validate"
+      ]
+    ]
+  },
+  {
+    "id": "fn_validate",
+    "type": "function",
+    "z": "main",
+    "name": "Validate & normalize",
+    "func": "\n// Validate schema and ranges; convert ts to UTC ISO string\nconst p = msg.payload;\nconst errs = [];\nfunction t(v){ return typeof v; }\n\nif (t(p.temp) !== 'number') errs.push('temp number required');\nif (t(p.g_force) !== 'number') errs.push('g_force number required');\nif (t(p.parcel_id) !== 'string' || !p.parcel_id.trim()) errs.push('parcel_id string required');\nif (!p.ts) errs.push('ts required');\n\n// basic sanity ranges (but allow extremes to be stored while flagged)\nif (p.temp < -50 || p.temp > 85) errs.push('temp out of sensor range');\nif (p.g_force < 0 || p.g_force > 16) errs.push('g_force out of sensor range');\n\nlet ts;\ntry { ts = new Date(p.ts); if (isNaN(ts.getTime())) throw new Error('bad'); }\ncatch(e){ errs.push('ts invalid datetime'); }\n\nif (errs.length){\n    node.warn('Validation failed: '+errs.join('; '));\n    // still store as raw with a flag? For simplicity, drop invalids:\n    msg.validation_error = errs;\n    return null;\n}\n\n// Normalize\nmsg.payload = {\n  parcel_id: p.parcel_id,\n  temp_c: p.temp,\n  g_force: p.g_force,\n  ts_utc: new Date(ts.toISOString()).toISOString(), // ensure UTC\n  raw_json: JSON.stringify(p)\n};\nmsg.received_at = new Date().toISOString();\nreturn msg;\n",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 600,
+    "y": 80,
+    "wires": [
+      [
+        "pg_insert"
+      ]
+    ]
+  },
+  {
+    "id": "pg_config",
+    "type": "postgres-config",
+    "name": "Postgres",
+    "host": "${POSTGRES_HOST}",
+    "port": "${POSTGRES_PORT}",
+    "db": "${POSTGRES_DB}",
+    "ssl": false
+  },
+  {
+    "id": "pg_insert",
+    "type": "postgres",
+    "z": "main",
+    "postgresDB": "pg_config",
+    "name": "Insert telemetry",
+    "output": false,
+    "perrow": false,
+    "query": "INSERT INTO telemetry_events (parcel_id,temp_c,g_force,ts_utc,received_at,raw_json) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id;",
+    "outputs": 1,
+    "x": 850,
+    "y": 80,
+    "wires": [
+      [
+        "anomaly_check"
+      ]
+    ],
+    "params": [
+      "payload.parcel_id",
+      "payload.temp_c",
+      "payload.g_force",
+      "payload.ts_utc",
+      "received_at",
+      "payload.raw_json"
+    ]
+  },
+  {
+    "id": "anomaly_check",
+    "type": "function",
+    "z": "main",
+    "name": "Detect anomalies (N consecutive)",
+    "func": "\nconst TEMP_TH = parseFloat(env.get('TEMP_THRESHOLD_C') || 8.0);\nconst GF_TH = parseFloat(env.get('GFORCE_THRESHOLD') || 2.5);\nconst N = parseInt(env.get('CONSECUTIVE_VIOLATIONS') || 3);\nconst throttleSec = parseInt(env.get('ALERT_THROTTLE_SECONDS') || 60);\n\nconst p = msg.payload; // still the insert result unless we pass original\n// we need original event; forward it via msg.event from previous node\nconst ev = msg.event || msg.payload || {};\nconst key = ev.parcel_id || 'unknown';\nconst ctx = flow.get('viol') || {};\nctx[key] = ctx[key] || { c:0, firstTs:null, lastAlert:0 };\nlet v = ctx[key];\nconst violate = (ev.temp_c > TEMP_TH) || (ev.g_force > GF_TH);\n\nif (violate){\n  v.c += 1;\n  if (!v.firstTs) v.firstTs = ev.ts_utc;\n} else {\n  v.c = 0;\n  v.firstTs = null;\n}\n\nflow.set('viol', ctx);\n\nconst now = Date.now();\nif (v.c >= N){\n  // throttle\n  if (now - v.lastAlert >= throttleSec*1000){\n    v.lastAlert = now;\n    flow.set('viol', ctx);\n    msg.alert = true;\n    msg.alert_info = {\n      parcel_id: key,\n      first_violation_ts: v.firstTs || ev.ts_utc,\n      reason: (ev.temp_c > TEMP_TH) ? 'temp' : 'g_force',\n      consecutive: v.c\n    };\n    return [msg];\n  }\n}\nreturn null;\n",
+    "outputs": 1,
+    "x": 280,
+    "y": 180,
+    "wires": [
+      [
+        "alert_insert",
+        "alert_slack"
+      ]
+    ]
+  },
+  {
+    "id": "alert_insert",
+    "type": "postgres",
+    "z": "main",
+    "postgresDB": "pg_config",
+    "name": "Insert alert",
+    "output": true,
+    "perrow": false,
+    "query": "INSERT INTO alerts (parcel_id, first_violation_ts, temp_threshold, gforce_threshold, consecutive_required, consecutive_observed, reason) VALUES ($1,$2,$3,$4,$5,$6,$7);",
+    "x": 560,
+    "y": 160,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "alert_slack",
+    "type": "http request",
+    "z": "main",
+    "name": "Slack webhook",
+    "method": "POST",
+    "ret": "txt",
+    "paytoqs": "ignore",
+    "url": "${SLACK_WEBHOOK_URL}",
+    "tls": "",
+    "persist": false,
+    "authType": "",
+    "x": 560,
+    "y": 200,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "alert_build",
+    "type": "function",
+    "z": "main",
+    "name": "Build Slack payload",
+    "func": "\nconst info = msg.alert_info;\nmsg.params = [\n  info.parcel_id,\n  info.first_violation_ts,\n  parseFloat(env.get('TEMP_THRESHOLD_C') || 8.0),\n  parseFloat(env.get('GFORCE_THRESHOLD') || 2.5),\n  parseInt(env.get('CONSECUTIVE_VIOLATIONS') || 3),\n  info.consecutive,\n  info.reason\n];\nmsg.payload = {\n  text: `ALERTA: Parcel ${info.parcel_id} con anomal\u00eda sostenida (${info.reason}). Inicio: ${info.first_violation_ts}.`\n};\nreturn msg;\n",
+    "x": 420,
+    "y": 200,
+    "wires": [
+      [
+        "alert_insert",
+        "alert_slack"
+      ]
+    ]
+  },
+  {
+    "id": "catch_pg",
+    "type": "catch",
+    "z": "main",
+    "name": "Catch DB errors",
+    "scope": [
+      "pg_insert",
+      "alert_insert"
+    ],
+    "uncaught": false,
+    "x": 220,
+    "y": 260,
+    "wires": [
+      [
+        "fn_enqueue"
+      ]
+    ]
+  },
+  {
+    "id": "fn_enqueue",
+    "type": "function",
+    "z": "main",
+    "name": "Enqueue for retry",
+    "func": "\nlet q = flow.get('retryQ') || [];\nq.push({ when: Date.now(), msg: msg._error && msg._error.source && msg._error.source.id === 'pg_insert' ? msg._error.source.msg : msg });\nflow.set('retryQ', q);\nnode.warn('Enqueued message for retry. Queue size='+q.length);\nreturn null;\n",
+    "x": 430,
+    "y": 260,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "tick",
+    "type": "inject",
+    "z": "main",
+    "name": "Flush queue every 5s",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "5",
+    "once": true,
+    "onceDelay": "2",
+    "x": 190,
+    "y": 320,
+    "wires": [
+      [
+        "fn_flush"
+      ]
+    ]
+  },
+  {
+    "id": "fn_flush",
+    "type": "function",
+    "z": "main",
+    "name": "Flush retry queue",
+    "func": "\nlet q = flow.get('retryQ') || [];\nif (!q.length) return null;\nconst item = q.shift();\nflow.set('retryQ', q);\n\n// Re-inject into the appropriate path; assume it's a telemetry insert\n// We stored original msg under item.msg\nlet m = item.msg || item;\n\n// ensure we still have the proper payload structure\nif (m.payload && m.payload.parcel_id && m.payload.temp_c !== undefined){\n    // send back to insert\n    return [m];\n}\nreturn null;\n",
+    "outputs": 1,
+    "x": 410,
+    "y": 320,
+    "wires": [
+      [
+        "pg_insert"
+      ]
+    ]
+  },
+  {
+    "id": "link_for_anom",
+    "type": "link",
+    "z": "main",
+    "name": "to anomaly",
+    "links": [],
+    "x": 600,
+    "y": 120,
+    "wires": [
+      [
+        "prep_anom"
+      ]
+    ]
+  },
+  {
+    "id": "prep_anom",
+    "type": "function",
+    "z": "main",
+    "name": "Prep event for anomaly path",
+    "func": "msg.event = msg.payload; msg.payload = msg.payload; return msg;",
+    "x": 850,
+    "y": 120,
+    "wires": [
+      [
+        "anomaly_check",
+        "pg_insert"
+      ]
+    ]
+  }
+]
