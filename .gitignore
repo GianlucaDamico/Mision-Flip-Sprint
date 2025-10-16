@@ -1,0 +1,3 @@
+.env
+flows/.config*.json
+flows/.config*.backup
