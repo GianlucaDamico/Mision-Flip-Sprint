@@ -26,3 +26,5 @@ python analytics/evaluate_model.py
 
 ## Estructura
 Consulte la pauta del enunciado; este repo ya incluye `diagrams/`, `flows/`, `db/ddl.sql`, `dashboards/`, `analytics/`, `security/`, `doc/`, `video/`.
+
+mario lo hizo todo
