@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 # --- Configuración del broker MQTT desde variables de entorno ---
-BROKER = os.getenv("MQTT_BROKER_HOST", "localhost")
+BROKER = os.getenv("MQTT_BROKER_HOST", "mosquitto")
 PORT = int(os.getenv("MQTT_BROKER_PORT", 1883))
 USER = os.getenv("MQTT_USERNAME", "guest")
 PWD  = os.getenv("MQTT_PASSWORD", "guest")
@@ -69,6 +69,9 @@ def main(parcel_id, anomaly=False, seconds=60):
         while time.time() - start_time < seconds:
             timestamp = datetime.now(timezone.utc).isoformat()
 
+            # 20% de probabilidad de generar anomalías en esta iteración
+            anomaly = random.random() < 0.2
+
             temp = generar_temperatura(anomaly)
             hum = generar_humedad(anomaly)
             gforce = generar_vibracion(anomaly)
@@ -84,10 +87,11 @@ def main(parcel_id, anomaly=False, seconds=60):
 
             # También enviamos un resumen general
             payload = {
+                "parcel_id": parcel_id,
                 "tS": timestamp,
                 "temp": temp,
                 "humedad": hum,
-                "gforce": gforce,
+                "g_force": gforce,
                 "gps": gps,
                 "puertaAbierta": door
             }
